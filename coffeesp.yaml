@@ -1,17 +1,20 @@
+# CoffeeSP ESPHome script by ejetzass
+# https://github.com/ejetzass/CoffeeSP/
+#
 # ----
 # CleverCoffee ESP32 PCB Rev 1.6 Pin Map
 # ----
-# HT_RL (Heater SSR)              -> GPIO2   (Slow PWM)
+# HT_RL (Heater SSR)              -> GPIO2  (Slow PWM)
 # PV_RL VALVE (3-way valve SSR)   -> GPIO17
 # PV_RL PUMP  (Pump SSR)          -> GPIO27
 # TSIC Temperature sensor         -> GPIO16
-# Status LED                      -> GPIO26   (active-low: set inverted true if needed)
+# Status LED                      -> GPIO26 (active-low: set inverted true if needed)
 # I2C SDA/SCL (OLED, pressure)    -> GPIO21 / GPIO22
-# Brew switch / optocoupler       -> GPIO34
+# Brew switch / optocouple        -> GPIO34
 # Steam switch                    -> GPIO35
 # Hot water switch (straight brew)-> GPIO36
-# Power switch                    -> GPIO39
-# Water level sensor (optional)   -> GPIO23
+# Power switch                    -> GPIO39 (currently unused)
+# Water level sensor (optional)   -> GPIO23 (currently unused)
 # Scale interface DAT2/DAT/CLK    -> GPIO25 / GPIO32 / GPIO33 (currently unused)
 # Reserved headers (future use)   -> GPIO1, GPIO3, GPIO4, GPIO5, GPIO18, GPIO19
 # JTAG debugger pads              -> GPIO12 (TDI), GPIO13 (TCK), GPIO14 (TMS), GPIO15 (TDO)
@@ -27,7 +30,7 @@ esphome:
   comment: "ESPHome PID controller with xs5871 TSIC integration, SH1106 128x64 display and relay control based on CleverCoffee PCB v1.6"
   project:
     name: coffeesp.espresso_controller
-    version: "1.4.3"
+    version: "1.5.0"
   on_boot:
     priority: -10
     then:
@@ -57,7 +60,7 @@ logger:
 
 api:
   encryption:
-    key: !secret esphomecoffee
+    key: !secret coffeesp_api_key
 
 ota:
   - platform: esphome
@@ -69,6 +72,42 @@ wifi:
   ap:
     ssid: "${friendly_name} Fallback AP"
     password: "${device_name}"
+
+# Enable web server on port 80
+web_server:
+  port: 80
+  auth:
+    username: !secret coffeesp_web_user
+    password: !secret coffeesp_web_pass
+  version: 3
+  sorting_groups:
+    - id: group_brew
+      name: "Brewing"
+      sorting_weight: 10
+    - id: group_time_settings
+      name: "Time Settings"
+      sorting_weight: 20
+    - id: group_temp_settings
+      name: "Temperature Settings"
+      sorting_weight: 30
+    - id: group_switch
+      name: "Switches"
+      sorting_weight: 40
+    - id: group_sensors
+      name: "Sensors"
+      sorting_weight: 50
+    - id: group_clean
+      name: "Cleaning"
+      sorting_weight: 70
+    - id: group_clean_settings
+      name: "Cleaning Settings"
+      sorting_weight: 80
+    - id: group_timer_settings
+      name: "Timer Settings"
+      sorting_weight: 90
+    - id: group_diag
+      name: "Diagnosis"
+      sorting_weight: 99
 
 time:
   - platform: homeassistant
@@ -198,6 +237,8 @@ text_sensor:
     name: "${friendly_name} Status"
     update_interval: never
     icon: mdi:coffee-maker
+    web_server:
+      sorting_group_id: group_sensors
 
 number:
   - platform: template
@@ -210,6 +251,8 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 100.0
+    web_server:
+      sorting_group_id: group_temp_settings
     on_value:
       - if:
           condition:
@@ -229,6 +272,8 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 125.0
+    web_server:
+      sorting_group_id: group_temp_settings
     on_value:
       - if:
           condition:
@@ -248,7 +293,9 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 5.0
-
+    web_server:
+      sorting_group_id: group_time_settings
+      
   - platform: template
     id: preinfuse_pause_time
     name: "Pre-infusion Pause Time"
@@ -259,6 +306,8 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 5.0
+    web_server:
+      sorting_group_id: group_time_settings
 
   - platform: template
     id: brew_run_time
@@ -270,6 +319,8 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 25.0
+    web_server:
+      sorting_group_id: group_time_settings
 
   - platform: template
     id: straight_brew_run_time
@@ -281,6 +332,8 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 30.0
+    web_server:
+      sorting_group_id: group_time_settings
 
   - platform: template
     id: steam_timer_minutes
@@ -292,6 +345,8 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 5.0
+    web_server:
+      sorting_group_id: group_timer_settings
 
   - platform: template
     id: idle_timer_minutes
@@ -303,6 +358,8 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 60.0
+    web_server:
+      sorting_group_id: group_timer_settings
 
   - platform: template
     id: backflush_step_time
@@ -314,6 +371,8 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 5.0
+    web_server:
+      sorting_group_id: group_clean_settings
 
   - platform: template
     id: purge_duration
@@ -325,6 +384,8 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 3.0
+    web_server:
+      sorting_group_id: group_clean_settings
 
 output:
   - platform: slow_pwm
@@ -367,6 +428,8 @@ switch:
     name: "Heating Element"
     icon: mdi:radiator
     optimistic: false
+    web_server:
+      sorting_group_id: group_switch
     restore_mode: RESTORE_DEFAULT_ON
     lambda: 'return id(heater_allowed);'
     turn_on_action:
@@ -410,6 +473,8 @@ switch:
     name: "Steam Mode"
     icon: mdi:weather-windy
     optimistic: false
+    web_server:
+      sorting_group_id: group_switch
     lambda: 'return id(steam_mode_active);'
     turn_on_action:
       - if:
@@ -429,6 +494,8 @@ switch:
     id: pump_override
     icon: mdi:pump
     optimistic: false
+    web_server:
+      sorting_group_id: group_switch
     lambda: 'return id(pump_override_state);'
     turn_on_action:
       - lambda: 'id(pump_override_state) = true;'
@@ -442,6 +509,8 @@ switch:
     id: valve_override
     icon: mdi:pipe-valve
     optimistic: false
+    web_server:
+      sorting_group_id: group_switch
     lambda: 'return id(valve_override_state);'
     turn_on_action:
       - lambda: 'id(valve_override_state) = true;'
@@ -454,6 +523,8 @@ button:
   - platform: template
     name: "Start Pre-infusion Brew"
     icon: mdi:coffee
+    web_server:
+      sorting_group_id: group_brew
     on_press:
       - if:
           condition:
@@ -464,6 +535,8 @@ button:
   - platform: template
     name: "Start Straight Brew"
     icon: mdi:coffee-to-go
+    web_server:
+      sorting_group_id: group_brew
     on_press:
       - if:
           condition:
@@ -474,6 +547,8 @@ button:
   - platform: template
     name: "Start Continuous Brew"
     icon: mdi:coffee-maker
+    web_server:
+      sorting_group_id: group_brew
     on_press:
       - if:
           condition:
@@ -484,12 +559,16 @@ button:
   - platform: template
     name: "Stop Brew / Process"
     icon: mdi:stop
+    web_server:
+      sorting_group_id: group_brew
     on_press:
       - script.execute: brew_abort
 
   - platform: template
     name: "Start Backflush"
     icon: mdi:water-sync
+    web_server:
+      sorting_group_id: group_clean
     on_press:
       - if:
           condition:
@@ -500,6 +579,8 @@ button:
   - platform: template
     name: "Start Purge"
     icon: mdi:water-plus
+    web_server:
+      sorting_group_id: group_clean
     on_press:
       - if:
           condition:
@@ -514,19 +595,27 @@ sensor:
     pin: GPIO16
     model: TSIC306
     update_interval: 0.5s
+    web_server:
+      sorting_group_id: group_sensors
 
   - platform: wifi_signal
     name: "WiFi RSSI"
     update_interval: 60s
+    web_server:
+      sorting_group_id: group_diag
 
   - platform: uptime
     name: "Controller Uptime"
     update_interval: 60s
+    web_server:
+      sorting_group_id: group_diag
 
 binary_sensor:
   - platform: gpio
     id: power_switch
     name: "Power Switch"
+    web_server:
+      sorting_group_id: group_sensors
     pin:
       number: GPIO39
       inverted: true
@@ -553,6 +642,8 @@ binary_sensor:
   - platform: gpio
     id: brew_switch
     name: "Pre-infusion Brew Switch"
+    web_server:
+      sorting_group_id: group_sensors
     pin:
       number: GPIO34
       inverted: true
@@ -571,6 +662,8 @@ binary_sensor:
   - platform: gpio
     id: straight_brew_switch
     name: "Straight Brew Switch"
+    web_server:
+      sorting_group_id: group_sensors
     pin:
       number: GPIO36
       inverted: true
@@ -589,6 +682,8 @@ binary_sensor:
   - platform: gpio
     id: steam_switch
     name: "Steam Switch"
+    web_server:
+      sorting_group_id: group_sensors
     pin:
       number: GPIO35
       inverted: true
@@ -606,6 +701,8 @@ climate:
   - platform: pid
     id: brew_pid
     name: "Boiler PID"
+    web_server:
+      sorting_group_id: group_sensors
     sensor: brew_boiler_temp
     default_target_temperature: 100 °C
     heat_output: heater_pwm
