@@ -18,15 +18,15 @@
 # ----
 
 substitutions:
-  device_name: esphomecoffee
-  friendly_name: ESPHomeCoffee
+  device_name: coffeesp
+  friendly_name: CoffeeSP
 
 esphome:
   name: ${device_name}
   friendly_name: ${friendly_name}
   comment: "ESPHome PID controller with xs5871 TSIC integration, SH1106 128x64 display and relay control based on CleverCoffee PCB v1.6"
   project:
-    name: esphomecoffee.espresso_controller
+    name: coffeesp.espresso_controller
     version: "1.4.3"
   on_boot:
     priority: -10
