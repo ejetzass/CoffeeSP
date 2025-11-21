@@ -1,20 +1,17 @@
-# CoffeeSP ESPHome script by ejetzass
-# https://github.com/ejetzass/CoffeeSP/
-#
 # ----
 # CleverCoffee ESP32 PCB Rev 1.6 Pin Map
 # ----
-# HT_RL (Heater SSR)              -> GPIO2  (Slow PWM)
+# HT_RL (Heater SSR)              -> GPIO2   (Burst-fired SSR)
 # PV_RL VALVE (3-way valve SSR)   -> GPIO17
 # PV_RL PUMP  (Pump SSR)          -> GPIO27
 # TSIC Temperature sensor         -> GPIO16
-# Status LED                      -> GPIO26 (active-low: set inverted true if needed)
+# Status LED                      -> GPIO26   (active-low: set inverted true if needed)
 # I2C SDA/SCL (OLED, pressure)    -> GPIO21 / GPIO22
-# Brew switch / optocouple        -> GPIO34
+# Brew switch / optocoupler       -> GPIO34
 # Steam switch                    -> GPIO35
 # Hot water switch (straight brew)-> GPIO36
-# Power switch                    -> GPIO39 (currently unused)
-# Water level sensor (optional)   -> GPIO23 (currently unused)
+# Power switch                    -> GPIO39
+# Water level sensor (optional)   -> GPIO23
 # Scale interface DAT2/DAT/CLK    -> GPIO25 / GPIO32 / GPIO33 (currently unused)
 # Reserved headers (future use)   -> GPIO1, GPIO3, GPIO4, GPIO5, GPIO18, GPIO19
 # JTAG debugger pads              -> GPIO12 (TDI), GPIO13 (TCK), GPIO14 (TMS), GPIO15 (TDO)
@@ -30,15 +27,11 @@ esphome:
   comment: "ESPHome PID controller with xs5871 TSIC integration, SH1106 128x64 display and relay control based on CleverCoffee PCB v1.6"
   project:
     name: coffeesp.espresso_controller
-    version: "1.5.0"
+    version: "1.8.7"
   on_boot:
     priority: -10
     then:
       - switch.turn_on: heater_enable
-      - climate.control:
-          id: brew_pid
-          mode: HEAT
-          target_temperature: !lambda 'return id(brew_set_temp)->state;'
       - lambda: |-
           const uint32_t now = millis();
           id(current_phase) = id(steam_mode_active) ? 5 : 0;
@@ -57,6 +50,15 @@ esp32:
     type: arduino
 
 logger:
+  level: DEBUG
+  initial_level: WARN
+  runtime_tag_levels: true
+  logs:
+    component: WARN
+    wifi: WARN
+    tsic: WARN
+    sensor: WARN
+    PID_DEBUG: DEBUG
 
 api:
   encryption:
@@ -90,12 +92,18 @@ web_server:
     - id: group_temp_settings
       name: "Temperature Settings"
       sorting_weight: 30
+    - id: group_pid_settings
+      name: "PID Settings"
+      sorting_weight: 35
     - id: group_switch
       name: "Switches"
       sorting_weight: 40
     - id: group_sensors
       name: "Sensors"
       sorting_weight: 50
+    - id: group_hardware
+      name: "Hardware Control"
+      sorting_weight: 60
     - id: group_clean
       name: "Cleaning"
       sorting_weight: 70
@@ -108,6 +116,9 @@ web_server:
     - id: group_diag
       name: "Diagnosis"
       sorting_weight: 99
+    - id: group_server
+      name: "Server & Logging"
+      sorting_weight: 90
 
 time:
   - platform: homeassistant
@@ -131,6 +142,10 @@ globals:
     restore_value: yes
     initial_value: 'true'
   - id: current_phase
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+  - id: last_brew_type
     type: uint8_t
     restore_value: no
     initial_value: '0'
@@ -230,6 +245,38 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
+  - id: active_brew_mode
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+  - id: last_kp
+    type: float
+    restore_value: no
+    initial_value: '-1.0f'
+  - id: last_tn
+    type: float
+    restore_value: no
+    initial_value: '-1.0f'
+  - id: last_tv
+    type: float
+    restore_value: no
+    initial_value: '-1.0f'
+  - id: last_integrator_max
+    type: float
+    restore_value: no
+    initial_value: '-1.0f'
+  - id: last_d_alpha
+    type: float
+    restore_value: no
+    initial_value: '-1.0f'
+  - id: last_window_ms
+    type: float
+    restore_value: no
+    initial_value: '-1.0f'
+  - id: pid_initialized
+    type: bool
+    restore_value: no
+    initial_value: 'false'
 
 text_sensor:
   - platform: template
@@ -239,6 +286,8 @@ text_sensor:
     icon: mdi:coffee-maker
     web_server:
       sorting_group_id: group_sensors
+
+
 
 number:
   - platform: template
@@ -253,14 +302,6 @@ number:
     initial_value: 100.0
     web_server:
       sorting_group_id: group_temp_settings
-    on_value:
-      - if:
-          condition:
-            lambda: 'return !id(steam_mode_active);'
-          then:
-            - climate.control:
-                id: brew_pid
-                target_temperature: !lambda 'return x;'
 
   - platform: template
     id: steam_set_temp
@@ -274,47 +315,195 @@ number:
     initial_value: 125.0
     web_server:
       sorting_group_id: group_temp_settings
-    on_value:
-      - if:
-          condition:
-            lambda: 'return id(steam_mode_active);'
-          then:
-            - climate.control:
-                id: brew_pid
-                target_temperature: !lambda 'return x;'
+
+  - platform: template
+    id: temp_sensor_offset
+    name: "Temperature Sensor Offset"
+    unit_of_measurement: "°C"
+    min_value: -10.0
+    max_value: 20.0
+    step: 0.1
+    optimistic: true
+    restore_value: true
+    initial_value: 0.0
+    web_server:
+      sorting_group_id: group_temp_settings
+
+  - platform: template
+    id: cc_kp
+    name: "PID Kp"
+    unit_of_measurement: ""
+    min_value: 0.1
+    max_value: 200.0
+    step: 0.1
+    optimistic: true
+    restore_value: true
+    initial_value: 48.0
+    web_server:
+      sorting_group_id: group_pid_settings
+
+  - platform: template
+    id: cc_tn
+    name: "PID Tn (Integral Time)"
+    unit_of_measurement: "s"
+    min_value: 1.0
+    max_value: 1000.0
+    step: 0.1
+    optimistic: true
+    restore_value: true
+    initial_value: 140
+    web_server:
+      sorting_group_id: group_pid_settings
+
+  - platform: template
+    id: cc_tv
+    name: "PID Tv (Derivative Time)"
+    unit_of_measurement: "s"
+    min_value: 0.1
+    max_value: 100.0
+    step: 0.1
+    optimistic: true
+    restore_value: true
+    initial_value: 10.0
+    web_server:
+      sorting_group_id: group_pid_settings
+
+  - platform: template
+    id: cc_steam_kp
+    name: "Steam Mode Kp Override"
+    unit_of_measurement: ""
+    min_value: 0.1
+    max_value: 500.0
+    step: 0.1
+    optimistic: true
+    restore_value: true
+    initial_value: 150.0
+    web_server:
+      sorting_group_id: group_pid_settings
+
+  - platform: template
+    id: cc_integrator_max
+    name: "PID Integrator Max"
+    unit_of_measurement: ""
+    min_value: 10.0
+    max_value: 500.0
+    step: 1.0
+    optimistic: true
+    restore_value: true
+    initial_value: 50.0
+    web_server:
+      sorting_group_id: group_pid_settings
+
+  - platform: template
+    id: cc_d_alpha
+    name: "PID D-term Filter Alpha"
+    unit_of_measurement: ""
+    min_value: 0.0
+    max_value: 1.0
+    step: 0.01
+    optimistic: true
+    restore_value: true
+    initial_value: 0.24
+    web_server:
+      sorting_group_id: group_pid_settings
+
+  - platform: template
+    id: cc_out_min
+    name: "PID Output Minimum"
+    unit_of_measurement: "%"
+    min_value: 0.0
+    max_value: 100.0
+    step: 0.1
+    optimistic: true
+    restore_value: true
+    initial_value: 0.0
+    web_server:
+      sorting_group_id: group_pid_settings
+
+  - platform: template
+    id: cc_out_max
+    name: "PID Output Maximum"
+    unit_of_measurement: "%"
+    min_value: 0.0
+    max_value: 100.0
+    step: 0.1
+    optimistic: true
+    restore_value: true
+    initial_value: 100.0
+    web_server:
+      sorting_group_id: group_pid_settings
+
+  - platform: template
+    id: cc_burst_window_ms
+    name: "PID Burst Window Duration"
+    unit_of_measurement: "ms"
+    min_value: 250
+    max_value: 10000
+    step: 50
+    optimistic: true
+    restore_value: true
+    initial_value: 1000.0
+    web_server:
+      sorting_group_id: group_pid_settings
 
   - platform: template
     id: preinfuse_on_time
-    name: "Pre-infusion Pump Time"
+    name: "Pressurized Pre-infusion Pump Time"
     unit_of_measurement: "s"
     min_value: 0
     max_value: 15
     step: 0.5
     optimistic: true
     restore_value: true
-    initial_value: 5.0
+    initial_value: 3.0
     web_server:
       sorting_group_id: group_time_settings
-      
+
   - platform: template
     id: preinfuse_pause_time
-    name: "Pre-infusion Pause Time"
+    name: "Pressurized Pre-infusion Pause Time"
     unit_of_measurement: "s"
     min_value: 0
     max_value: 15
     step: 0.5
     optimistic: true
     restore_value: true
-    initial_value: 5.0
+    initial_value: 3.0
     web_server:
       sorting_group_id: group_time_settings
 
   - platform: template
     id: brew_run_time
-    name: "Brew Time (pre-infusion)"
+    name: "Brew Time (pressurized)"
     unit_of_measurement: "s"
-    min_value: 5
+    min_value: 15
     max_value: 60
+    step: 0.5
+    optimistic: true
+    restore_value: true
+    initial_value: 25.0
+    web_server:
+      sorting_group_id: group_time_settings
+
+  - platform: template
+    id: soft_preinfuse_time
+    name: "Soft Pre-infusion Time"
+    unit_of_measurement: "s"
+    min_value: 1.0
+    max_value: 15.0
+    step: 0.5
+    optimistic: true
+    restore_value: true
+    initial_value: 3.0
+    web_server:
+      sorting_group_id: group_time_settings
+
+  - platform: template
+    id: soft_brew_run_time
+    name: "Brew Time (soft)"
+    unit_of_measurement: "s"
+    min_value: 15.0
+    max_value: 60.0
     step: 0.5
     optimistic: true
     restore_value: true
@@ -326,12 +515,12 @@ number:
     id: straight_brew_run_time
     name: "Brew Time (straight)"
     unit_of_measurement: "s"
-    min_value: 5
+    min_value: 15
     max_value: 60
     step: 0.5
     optimistic: true
     restore_value: true
-    initial_value: 30.0
+    initial_value: 25.0
     web_server:
       sorting_group_id: group_time_settings
 
@@ -344,7 +533,7 @@ number:
     step: 1
     optimistic: true
     restore_value: true
-    initial_value: 5.0
+    initial_value: 10.0
     web_server:
       sorting_group_id: group_timer_settings
 
@@ -362,8 +551,8 @@ number:
       sorting_group_id: group_timer_settings
 
   - platform: template
-    id: backflush_step_time
-    name: "Backflush Step Time"
+    id: result_display_time
+    name: "Result Display Time"
     unit_of_measurement: "s"
     min_value: 1
     max_value: 30
@@ -371,6 +560,46 @@ number:
     optimistic: true
     restore_value: true
     initial_value: 5.0
+    web_server:
+      sorting_group_id: group_timer_settings
+
+  - platform: template
+    id: backflush_fill_time
+    name: "Backflush Fill Time"
+    unit_of_measurement: "s"
+    min_value: 3
+    max_value: 10
+    step: 0.5
+    optimistic: true
+    restore_value: true
+    initial_value: 5.0
+    web_server:
+      sorting_group_id: group_clean_settings
+
+  - platform: template
+    id: backflush_flush_time
+    name: "Backflush Flush Time"
+    unit_of_measurement: "s"
+    min_value: 5
+    max_value: 20
+    step: 0.5
+    optimistic: true
+    restore_value: true
+    initial_value: 10.0
+    web_server:
+      sorting_group_id: group_clean_settings
+
+  - platform: template
+    id: backflush_cycles
+    name: "Backflush Cycles"
+    unit_of_measurement: "cycles"
+    min_value: 1
+    max_value: 20
+    step: 1
+    mode: box
+    optimistic: true
+    restore_value: true
+    initial_value: 5
     web_server:
       sorting_group_id: group_clean_settings
 
@@ -388,27 +617,6 @@ number:
       sorting_group_id: group_clean_settings
 
 output:
-  - platform: slow_pwm
-    id: heater_pwm_hw
-    pin: GPIO2
-    period: 1s
-    min_power: 0.0
-    max_power: 1.0
-
-  - platform: template
-    id: heater_pwm
-    type: float
-    write_action:
-      lambda: |-
-        float effective = state;
-        if (!id(heater_allowed)) {
-          effective = 0.0f;
-        }
-        if (effective < 0.0f) effective = 0.0f;
-        if (effective > 1.0f) effective = 1.0f;
-        id(heater_output_level) = effective;
-        id(heater_pwm_hw).set_level(effective);
-
   - platform: gpio
     id: pump_output
     pin: GPIO27
@@ -423,6 +631,11 @@ status_led:
     inverted: true
 
 switch:
+  - platform: gpio
+    id: heater_ssr
+    pin: GPIO2
+    restore_mode: ALWAYS_OFF
+
   - platform: template
     id: heater_enable
     name: "Heating Element"
@@ -430,64 +643,44 @@ switch:
     optimistic: false
     web_server:
       sorting_group_id: group_switch
-    restore_mode: RESTORE_DEFAULT_ON
+    restore_mode: ALWAYS_ON
     lambda: 'return id(heater_allowed);'
     turn_on_action:
-      - lambda: 'id(heater_allowed) = true;'
-      - climate.control:
-          id: brew_pid
-          mode: HEAT
-          target_temperature: !lambda |-
-            return id(steam_mode_active)
-                ? id(steam_set_temp)->state
-                : id(brew_set_temp)->state;
-      - script.execute: start_idle_timer
       - if:
           condition:
-            lambda: 'return !id(steam_mode_active) && !id(brewing_active) && !id(continuous_brew_active);'
+            lambda: |-
+              if (isnan(id(brew_boiler_temp).state) || !id(brew_boiler_temp).has_state()) {
+                return false;
+              }
+              return true;
           then:
+            - lambda: 'id(heater_allowed) = true;'
+            - script.execute: start_idle_timer
+            - if:
+                condition:
+                  lambda: 'return !id(steam_mode_active) && !id(brewing_active) && !id(continuous_brew_active);'
+                then:
+                  - text_sensor.template.publish:
+                      id: machine_status_text
+                      state: !lambda "return (!id(pump_relay_enable)->state && !id(valve_relay_enable)->state) ? \"PID only\" : \"Idle\";"
+          else:
             - text_sensor.template.publish:
                 id: machine_status_text
-                state: "Idle"
+                state: "Temp invalid"
     turn_off_action:
       - lambda: 'id(heater_allowed) = false;'
       - if:
           condition:
             lambda: 'return id(steam_mode_active);'
           then:
-            - switch.turn_off: steam_mode_switch
-      - climate.control:
-          id: brew_pid
-          mode: "OFF"
-      - output.turn_off: heater_pwm
+            - script.execute: exit_steam_mode
+      - switch.turn_off: heater_ssr
       - lambda: |-
-          id(heater_pwm_hw).set_level(0.0f);
           id(heater_output_level) = 0.0f;
       - script.execute: cancel_idle_timer
       - text_sensor.template.publish:
           id: machine_status_text
           state: "Heater disabled"
-
-  - platform: template
-    id: steam_mode_switch
-    name: "Steam Mode"
-    icon: mdi:weather-windy
-    optimistic: false
-    web_server:
-      sorting_group_id: group_switch
-    lambda: 'return id(steam_mode_active);'
-    turn_on_action:
-      - if:
-          condition:
-            lambda: 'return !id(steam_mode_active) && !id(brewing_active) && !id(continuous_brew_active) && id(cleaning_mode) == 0;'
-          then:
-            - script.execute: enter_steam_mode
-    turn_off_action:
-      - if:
-          condition:
-            lambda: 'return id(steam_mode_active);'
-          then:
-            - script.execute: exit_steam_mode
 
   - platform: template
     name: "Pump SSR Override"
@@ -498,8 +691,12 @@ switch:
       sorting_group_id: group_switch
     lambda: 'return id(pump_override_state);'
     turn_on_action:
-      - lambda: 'id(pump_override_state) = true;'
-      - script.execute: pump_output_on
+      - if:
+          condition:
+            lambda: 'return id(pump_relay_enable)->state;'
+          then:
+            - lambda: 'id(pump_override_state) = true;'
+            - script.execute: pump_output_on
     turn_off_action:
       - lambda: 'id(pump_override_state) = false;'
       - script.execute: pump_output_off_guard
@@ -513,15 +710,104 @@ switch:
       sorting_group_id: group_switch
     lambda: 'return id(valve_override_state);'
     turn_on_action:
-      - lambda: 'id(valve_override_state) = true;'
-      - script.execute: valve_output_on
+      - if:
+          condition:
+            lambda: 'return id(valve_relay_enable)->state;'
+          then:
+            - lambda: 'id(valve_override_state) = true;'
+            - script.execute: valve_output_on
     turn_off_action:
       - lambda: 'id(valve_override_state) = false;'
       - script.execute: valve_output_off_guard
 
+  - platform: template
+    id: idle_timer_enable
+    name: "Idle Timer Enable"
+    icon: mdi:timer-off
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    web_server:
+      sorting_group_id: group_timer_settings
+
+  - platform: template
+    id: steam_timer_enable
+    name: "Steam Timer Enable"
+    icon: mdi:timer-off
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    web_server:
+      sorting_group_id: group_timer_settings
+
+  - platform: template
+    id: pid_debug_enable
+    name: "PID Debug Logging"
+    icon: mdi:bug
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    web_server:
+      sorting_group_id: group_server
+
+  - platform: template
+    id: sensor_logging_enable
+    name: "Sensor Logging"
+    icon: mdi:gauge
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    web_server:
+      sorting_group_id: group_server
+
+  - platform: template
+    id: pump_relay_enable
+    name: "Pump Relay Enable"
+    icon: mdi:pump
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    web_server:
+      sorting_group_id: group_hardware
+    turn_off_action:
+      - if:
+          condition:
+            lambda: 'return id(pump_override_state);'
+          then:
+            - switch.turn_off: pump_override
+
+  - platform: template
+    id: valve_relay_enable
+    name: "3-Way Valve Relay Enable"
+    icon: mdi:pipe-valve
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    web_server:
+      sorting_group_id: group_hardware
+    turn_off_action:
+      - if:
+          condition:
+            lambda: 'return id(valve_override_state);'
+          then:
+            - switch.turn_off: valve_override
+
 button:
   - platform: template
-    name: "Start Pre-infusion Brew"
+    id: steam_mode_toggle
+    name: "Steam Mode"
+    icon: mdi:weather-windy
+    web_server:
+      sorting_group_id: group_brew
+    on_press:
+      - if:
+          condition:
+            lambda: 'return id(steam_mode_active);'
+          then:
+            - script.execute: exit_steam_mode
+          else:
+            - if:
+                condition:
+                  lambda: 'return !id(brewing_active) && !id(continuous_brew_active) && id(cleaning_mode) == 0;'
+                then:
+                  - script.execute: enter_steam_mode
+
+  - platform: template
+    name: "Start Pressurized Pre-infusion Brew"
     icon: mdi:coffee
     web_server:
       sorting_group_id: group_brew
@@ -530,7 +816,21 @@ button:
           condition:
             lambda: 'return !id(brewing_active) && !id(continuous_brew_active) && id(cleaning_mode) == 0;'
           then:
+            - lambda: 'id(active_brew_mode) = 1;'
             - script.execute: brew_preinfusion
+
+  - platform: template
+    name: "Start Soft Pre-infusion Brew"
+    icon: mdi:coffee-outline
+    web_server:
+      sorting_group_id: group_brew
+    on_press:
+      - if:
+          condition:
+            lambda: 'return !id(brewing_active) && !id(continuous_brew_active) && id(cleaning_mode) == 0;'
+          then:
+            - lambda: 'id(active_brew_mode) = 2;'
+            - script.execute: brew_soft_preinfusion
 
   - platform: template
     name: "Start Straight Brew"
@@ -542,6 +842,7 @@ button:
           condition:
             lambda: 'return !id(brewing_active) && !id(continuous_brew_active) && id(cleaning_mode) == 0;'
           then:
+            - lambda: 'id(active_brew_mode) = 3;'
             - script.execute: brew_straight
 
   - platform: template
@@ -554,6 +855,7 @@ button:
           condition:
             lambda: 'return !id(brewing_active) && !id(continuous_brew_active) && id(cleaning_mode) == 0;'
           then:
+            - lambda: 'id(active_brew_mode) = 4;'
             - script.execute: brew_continuous
 
   - platform: template
@@ -588,6 +890,29 @@ button:
           then:
             - script.execute: clean_purge
 
+  - platform: template
+    name: "Reset Idle Timer"
+    icon: mdi:timer-refresh
+    web_server:
+      sorting_group_id: group_timer_settings
+    on_press:
+      - lambda: |-
+          // Restart the idle timer from now
+          id(idle_timer_active) = true;
+          id(idle_timer_expired) = false;
+          id(idle_timer_start_ms) = millis();
+
+  - platform: template
+    name: "Reset Steam Timer"
+    icon: mdi:timer-refresh
+    web_server:
+      sorting_group_id: group_timer_settings
+    on_press:
+      - lambda: |-
+          // Restart the steam timer from now
+          id(steam_timer_active) = true;
+          id(steam_timer_start_ms) = millis();
+
 sensor:
   - platform: tsic
     id: brew_boiler_temp
@@ -595,6 +920,28 @@ sensor:
     pin: GPIO16
     model: TSIC306
     update_interval: 0.5s
+    filters:
+      - lambda: 'return x + id(temp_sensor_offset)->state;'
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: |-
+                // If the temperature is invalid (NaN) and the heater is currently allowed,
+                // disable the heater and update status.
+                if (isnan(x) && id(heater_allowed)) {
+                  return true;
+                }
+                return false;
+            then:
+              - lambda: 'id(heater_allowed) = false;'
+              - switch.turn_off: heater_ssr
+              - lambda: |-
+                  // Ensure hardware output and state variable are cleared immediately.
+                  id(heater_output_level) = 0.0f;
+              - text_sensor.template.publish:
+                  id: machine_status_text
+                  state: "Temp invalid"
     web_server:
       sorting_group_id: group_sensors
 
@@ -611,9 +958,26 @@ sensor:
       sorting_group_id: group_diag
 
 binary_sensor:
+  - platform: status
+    name: "Power Status"
+    id: power_status
+    device_class: power
+    web_server:
+      sorting_group_id: group_sensors
+
+  - platform: template
+    id: steam_mode_status
+    name: "Steam Mode Status"
+    device_class: running
+    icon: mdi:weather-windy
+    web_server:
+      sorting_group_id: group_sensors
+    lambda: |-
+      return id(steam_mode_active);
+
   - platform: gpio
-    id: power_switch
-    name: "Power Switch"
+    id: soft_brew_switch
+    name: "Soft Pre-Infusion Input (GPIO39)"
     web_server:
       sorting_group_id: group_sensors
     pin:
@@ -621,27 +985,19 @@ binary_sensor:
       inverted: true
       mode:
         input: true
-    device_class: power
     filters:
       - delayed_on: 15ms
       - delayed_off: 15ms
-    on_release:
-      - script.execute: brew_abort
-      - if:
-          condition:
-            switch.is_on: heater_enable
-          then:
-            - switch.turn_off: heater_enable
     on_press:
       - if:
           condition:
-            switch.is_off: heater_enable
+            lambda: 'return !id(brewing_active) && !id(continuous_brew_active) && id(cleaning_mode) == 0;'
           then:
-            - switch.turn_on: heater_enable
+            - script.execute: brew_soft_preinfusion
 
   - platform: gpio
     id: brew_switch
-    name: "Pre-infusion Brew Switch"
+    name: "Pre-Infusion Input (GPIO34)"
     web_server:
       sorting_group_id: group_sensors
     pin:
@@ -661,7 +1017,7 @@ binary_sensor:
 
   - platform: gpio
     id: straight_brew_switch
-    name: "Straight Brew Switch"
+    name: "Straight Brew Input (GPIO36)"
     web_server:
       sorting_group_id: group_sensors
     pin:
@@ -681,7 +1037,7 @@ binary_sensor:
 
   - platform: gpio
     id: steam_switch
-    name: "Steam Switch"
+    name: "Steam Input (GPIO35)"
     web_server:
       sorting_group_id: group_sensors
     pin:
@@ -693,35 +1049,175 @@ binary_sensor:
       - delayed_on: 15ms
       - delayed_off: 15ms
     on_press:
-      - switch.turn_on: steam_mode_switch
-    on_release:
-      - switch.turn_off: steam_mode_switch
+      - button.press: steam_mode_toggle
 
-climate:
-  - platform: pid
-    id: brew_pid
-    name: "Boiler PID"
-    web_server:
-      sorting_group_id: group_sensors
-    sensor: brew_boiler_temp
-    default_target_temperature: 100 °C
-    heat_output: heater_pwm
-    visual:
-      min_temperature: 60 °C
-      max_temperature: 150 °C
-      temperature_step: 0.1 °C
-    control_parameters:
-      kp: 25.0
-      ki: 0.15
-      kd: 120.0
-    on_state:
-      - if:
-          condition:
-            lambda: 'return !id(heater_allowed);'
-          then:
-            - output.turn_off: heater_pwm
-
+# CleverCoffee-style PID with Burst-fired SSR Control
 interval:
+  - interval: 0.1s
+    then:
+      - lambda: |-
+          // CleverCoffee-style PID + burst-fired SSR output
+
+          // Persistent state
+          static uint32_t last_ms = millis();
+          static float last_temp = NAN;
+          static float d_filt = 0.0f;        // filtered D term
+          static float Iacc = 0.0f;          // raw integral accumulator (pre-Ki)
+          static uint32_t window_start_ms = millis();
+
+          auto clamp01 = [](float x) { return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x); };
+          auto clampPct = [](float x) { return x < 0.0f ? 0.0f : (x > 100.0f ? 100.0f : x); };
+
+          if (!id(heater_allowed) || !id(brew_boiler_temp).has_state() || isnan(id(brew_boiler_temp).state)) {
+            id(heater_ssr).turn_off();
+            Iacc = 0.0f; d_filt = 0.0f; last_temp = NAN;
+            window_start_ms = millis();
+            return;
+          }
+
+          // dt (s)
+          const uint32_t now_ms = millis();
+          float dt = (now_ms - last_ms) / 1000.0f;
+          if (dt <= 0.0f || dt > 5.0f) dt = 0.1f;  // fallback to nominal cadence
+          last_ms = now_ms;
+
+          // CleverCoffee parameters
+          const float setpoint = id(steam_mode_active) ?
+                                 id(steam_set_temp)->state : id(brew_set_temp)->state;
+          const float Kp = id(steam_mode_active) ?
+                           id(cc_steam_kp)->state : id(cc_kp)->state;
+          const float Tn = id(cc_tn)->state;
+          const float Tv = id(cc_tv)->state;
+          const float Imax = id(cc_integrator_max)->state;    // pre-Ki clamp
+          const float out_min = id(cc_out_min)->state;        // %
+          const float out_max = id(cc_out_max)->state;        // %
+          const float d_alpha = id(cc_d_alpha)->state;        // 0..1
+          const float window_ms_f = id(cc_burst_window_ms)->state;  // e.g. 2000 ms
+          const float window_ms = fmaxf(window_ms_f, 250.0f);       // enforce minimum window
+
+          // Derived gains
+          float Ki = 0.0f;
+          if (Tn > 0.0f) Ki = Kp / Tn;
+          const float Kd = Kp * Tv;
+
+          // Process variables
+          const float pv = id(brew_boiler_temp).state;
+          const float err = setpoint - pv;
+
+          if (isnan(last_temp)) last_temp = pv;
+          const float d_meas = (pv - last_temp) / dt;
+
+          // Clamp implausible sensor jumps (TSIC glitches)
+          const float max_dpv = 1.2f;  // °C per second, was 2.0
+          float d_meas_clamped = d_meas;
+          if (d_meas_clamped > max_dpv) d_meas_clamped = max_dpv;
+          if (d_meas_clamped < -max_dpv) d_meas_clamped = -max_dpv;
+
+          // Deadband to stop integrating sensor quantisation noise, was 0.05 originally
+          const float integral_deadband = 0.1f;  // °C
+
+          // does not work! if (fabsf(err) <= integral_deadband) d_meas_clamped = 0.0f; // added later
+          const float P = Kp * err;
+          const float D_raw = -Kd * d_meas_clamped;
+          d_filt = d_alpha * D_raw + (1.0f - d_alpha) * d_filt;
+          const float D = d_filt;
+
+          // Conditional integration with deadband
+          float u_no_i = P + D;
+          bool can_I = true;
+          float tentative = u_no_i + Ki * Iacc;
+          if ((tentative >= out_max && err > 0.0f) || (tentative <= out_min && err < 0.0f)) {
+            can_I = false;
+          }
+          // Deadband calculation
+          if (can_I && fabsf(err) > integral_deadband) {
+            Iacc += err * dt;
+          }
+
+          if (Iacc > Imax) Iacc = Imax;
+          if (Iacc < -Imax) Iacc = -Imax;
+
+          const float I = Ki * Iacc;
+
+          float out_pct = P + I + D;
+          if (out_pct > out_max) out_pct = out_max;
+          if (out_pct < out_min) out_pct = out_min;
+
+          // Time-proportioning (burst) output
+          if (now_ms - window_start_ms >= window_ms) {
+            // start a new window
+            window_start_ms += window_ms;
+            if (now_ms - window_start_ms >= window_ms) {
+              window_start_ms = now_ms; // catch missed windows
+            }
+          }
+
+          const float duty = clamp01(out_pct / 100.0f);
+          const float on_ms = duty * window_ms;
+          const float elapsed_in_window = now_ms - window_start_ms;
+
+          if (elapsed_in_window < on_ms && duty > 0.0f) {
+            id(heater_ssr).turn_on();
+          } else {
+            id(heater_ssr).turn_off();
+          }
+
+          last_temp = pv;
+
+          // Store heater output level for display
+          id(heater_output_level) = out_pct / 100.0f;
+
+          // Check for PID parameter changes
+          bool params_changed = false;
+          bool window_changed = false;
+          if (id(last_kp) != Kp || id(last_tn) != Tn || id(last_tv) != Tv ||
+              id(last_integrator_max) != Imax || id(last_d_alpha) != d_alpha) {
+            params_changed = true;
+            id(last_kp) = Kp;
+            id(last_tn) = Tn;
+            id(last_tv) = Tv;
+            id(last_integrator_max) = Imax;
+            id(last_d_alpha) = d_alpha;
+          }
+
+          if (id(last_window_ms) != window_ms) {
+            window_changed = true;
+            id(last_window_ms) = window_ms;
+          }
+
+          // Additional useful PID debugging metrics
+          const float err_rate = (dt > 0.0f) ? (err / dt) : 0.0f;  // Rate of change of error
+          const float output_rate = (dt > 0.0f) ? ((out_pct - 100.0f * id(heater_output_level)) / dt) : 0.0f;  // Rate of change of output
+          const bool integral_saturated = (Iacc >= Imax || Iacc <= -Imax);
+          const float pid_terms_sum = P + I + D;
+          const float pid_gain_ratio = (err != 0.0f) ? (out_pct / err) : 0.0f;  // Overall gain ratio
+
+          if (id(pid_debug_enable).state) {
+            if (!id(pid_initialized)) {
+              // Log all PID inputs once after boot for debugging
+              ESP_LOGI("PID_DEBUG", "PID Initialized: Kp=%.1f Tn=%.1f Tv=%.1f IntegratorMax=%.0f DAlpha=%.2f OutMin=%.1f OutMax=%.1f Window=%.0fms SP=%.2f",
+                       Kp, Tn, Tv, Imax, d_alpha, out_min, out_max, window_ms, setpoint);
+              id(pid_initialized) = true;
+            }
+
+            if (params_changed || window_changed) {
+              if (window_changed) {
+                ESP_LOGI("PID_DEBUG",
+                         "PID Parameters & Window: Kp=%.1f Tn=%.1f Tv=%.1f IntegratorMax=%.0f DAlpha=%.2f Window=%.0fms dt=%.3fs SP=%.2f PV=%.2f err=%.3f P=%.2f I=%.2f (Iacc=%.2f) D=%.2f (Df=%.2f) out=%.1f%% gain=%.2f int_sat=%d",
+                         Kp, Tn, Tv, Imax, d_alpha, window_ms, dt, setpoint, pv, err, P, I, Iacc, D, d_filt, out_pct, pid_gain_ratio, integral_saturated ? 1 : 0);
+              } else {
+                ESP_LOGI("PID_DEBUG",
+                         "PID Parameters: Kp=%.1f Tn=%.1f Tv=%.1f IntegratorMax=%.0f DAlpha=%.2f dt=%.3fs SP=%.2f PV=%.2f err=%.3f P=%.2f I=%.2f (Iacc=%.2f) D=%.2f (Df=%.2f) out=%.1f%% gain=%.2f int_sat=%d",
+                         Kp, Tn, Tv, Imax, d_alpha, dt, setpoint, pv, err, P, I, Iacc, D, d_filt, out_pct, pid_gain_ratio, integral_saturated ? 1 : 0);
+              }
+            } else {
+              ESP_LOGI("PID_DEBUG",
+                       "dt=%.3fs SP=%.2f PV=%.2f err=%.3f err_rate=%.2f P=%.2f I=%.2f (Iacc=%.2f) D=%.2f (Df=%.2f) out=%.1f%% out_rate=%.2f gain=%.2f int_sat=%d",
+                       dt, setpoint, pv, err, err_rate, P, I, Iacc, D, d_filt, out_pct, output_rate, pid_gain_ratio, integral_saturated ? 1 : 0);
+            }
+          }
+
+  # Timer handling (preserved from original)
   - interval: 1s
     then:
       - lambda: |-
@@ -744,7 +1240,7 @@ interval:
             if (duration_ms > 0 && now - id(steam_timer_start_ms) >= duration_ms) {
               id(steam_timer_active) = false;
               id(machine_status_text).publish_state("Steam timer");
-              id(steam_mode_switch).turn_off();
+              id(exit_steam_mode).execute();
             }
           }
 
@@ -752,7 +1248,11 @@ interval:
               id(brew_finish_display_until) > 0 && now >= id(brew_finish_display_until)) {
             id(brew_finish_display_until) = 0;
             if (!id(steam_mode_active) && id(heater_allowed) && !id(idle_timer_expired)) {
-              id(machine_status_text).publish_state("Idle");
+              if (!id(pump_relay_enable)->state && !id(valve_relay_enable)->state) {
+                id(machine_status_text).publish_state("PID only");
+              } else {
+                id(machine_status_text).publish_state("Idle");
+              }
             }
           }
 
@@ -760,7 +1260,11 @@ interval:
             id(cleaning_complete_until) = 0;
             if (!id(steam_mode_active) && !id(brewing_active) &&
                 !id(continuous_brew_active) && id(cleaning_mode) == 0) {
-              id(machine_status_text).publish_state(id(heater_allowed) ? "Idle" : "Heater disabled");
+              if (!id(pump_relay_enable)->state && !id(valve_relay_enable)->state) {
+                id(machine_status_text).publish_state(id(heater_allowed) ? "PID only" : "Heater disabled");
+              } else {
+                id(machine_status_text).publish_state(id(heater_allowed) ? "Idle" : "Heater disabled");
+              }
             }
           }
 
@@ -768,7 +1272,11 @@ script:
   - id: pump_output_on
     mode: restart
     then:
-      - output.turn_on: pump_output
+      - if:
+          condition:
+            lambda: 'return id(pump_relay_enable)->state;'
+          then:
+            - output.turn_on: pump_output
 
   - id: pump_output_off_guard
     mode: restart
@@ -782,7 +1290,11 @@ script:
   - id: valve_output_on
     mode: restart
     then:
-      - output.turn_on: valve_output
+      - if:
+          condition:
+            lambda: 'return id(valve_relay_enable)->state;'
+          then:
+            - output.turn_on: valve_output
 
   - id: valve_output_off_guard
     mode: restart
@@ -796,10 +1308,14 @@ script:
   - id: start_idle_timer
     mode: restart
     then:
-      - lambda: |-
-          id(idle_timer_active) = true;
-          id(idle_timer_expired) = false;
-          id(idle_timer_start_ms) = millis();
+      - if:
+          condition:
+            lambda: 'return id(idle_timer_enable)->state;'
+          then:
+            - lambda: |-
+                id(idle_timer_active) = true;
+                id(idle_timer_expired) = false;
+                id(idle_timer_start_ms) = millis();
 
   - id: cancel_idle_timer
     mode: restart
@@ -809,9 +1325,13 @@ script:
   - id: start_steam_timer
     mode: restart
     then:
-      - lambda: |-
-          id(steam_timer_active) = true;
-          id(steam_timer_start_ms) = millis();
+      - if:
+          condition:
+            lambda: 'return id(steam_timer_enable)->state;'
+          then:
+            - lambda: |-
+                id(steam_timer_active) = true;
+                id(steam_timer_start_ms) = millis();
 
   - id: cancel_steam_timer
     mode: restart
@@ -838,8 +1358,19 @@ script:
           id(phase_start_ms) = now;
           id(current_phase) = id(steam_mode_active) ? 5 : 0;
           if (id(brew_cycle_success)) {
-            id(brew_finish_display_until) = now + 15000UL;
-            id(machine_status_text).publish_state("Brew finished");
+            const uint32_t display_ms = static_cast<uint32_t>(id(result_display_time)->state * 1000.0f);
+            id(brew_finish_display_until) = now + display_ms;
+            if (id(last_brew_type) == 1) {
+              id(machine_status_text).publish_state("Brew Finished: Pre-Infusion");
+            } else if (id(last_brew_type) == 2) {
+              id(machine_status_text).publish_state("Brew Finished: Soft");
+            } else if (id(last_brew_type) == 3) {
+              id(machine_status_text).publish_state("Brew Finished: Straight");
+            } else if (id(last_brew_type) == 4) {
+              id(machine_status_text).publish_state("Brew Finished: Continuous");
+            } else {
+              id(machine_status_text).publish_state("Brew Finished");
+            }
           } else if (!id(steam_mode_active)) {
             id(machine_status_text).publish_state("Idle");
           }
@@ -873,7 +1404,7 @@ script:
                 id(total_start_ms) = now;
                 id(phase_duration_ms) = 0;
                 id(phase_start_ms) = now;
-                id(machine_status_text).publish_state("Continuous stop");
+                id(machine_status_text).publish_state("Brewing: Continuous Stopped");
             - delay: 500ms
             - if:
                 condition:
@@ -908,6 +1439,7 @@ script:
     then:
       - lambda: |-
           id(brewing_active) = true;
+          id(last_brew_type) = 1;
           id(continuous_brew_active) = false;
           id(steam_mode_active) = false;
           id(brew_cycle_success) = true;
@@ -929,16 +1461,9 @@ script:
             id(current_phase) = 3;
             id(phase_duration_ms) = brew_ms;
           }
-      - switch.template.publish:
-          id: steam_mode_switch
-          state: false
-      - climate.control:
-          id: brew_pid
-          mode: HEAT
-          target_temperature: !lambda 'return id(brew_set_temp)->state;'
       - text_sensor.template.publish:
           id: machine_status_text
-          state: "Preinfuse"
+          state: "Brewing: Pre-Infusion"
       - script.execute: valve_output_on
       - if:
           condition:
@@ -973,12 +1498,50 @@ script:
           state: "Finish"
       - script.execute: brew_finish
 
+  - id: brew_soft_preinfusion
+    mode: restart
+    then:
+      - lambda: |-
+          id(brewing_active) = true;
+          id(continuous_brew_active) = false;
+          id(steam_mode_active) = false;
+          id(last_brew_type) = 2;
+          id(brew_cycle_success) = true;
+          id(brew_finish_display_until) = 0;
+          const uint32_t now = millis();
+          const uint32_t soft_pre_ms = static_cast<uint32_t>(id(soft_preinfuse_time)->state * 1000.0f);
+          const uint32_t brew_ms = static_cast<uint32_t>(id(soft_brew_run_time)->state * 1000.0f);
+          id(total_start_ms) = now;
+          id(total_duration_ms) = soft_pre_ms + brew_ms;
+          id(phase_start_ms) = now;
+          id(current_phase) = 1;
+          id(phase_duration_ms) = soft_pre_ms;
+      - text_sensor.template.publish:
+          id: machine_status_text
+          state: "Brewing: Soft Pre-Infusion"
+      - script.execute: valve_output_on
+      - delay: !lambda 'return static_cast<uint32_t>(id(soft_preinfuse_time)->state * 1000.0f);'
+      - text_sensor.template.publish:
+          id: machine_status_text
+          state: "Brewing: Soft"
+      - lambda: |-
+          id(current_phase) = 3;
+          id(phase_start_ms) = millis();
+          id(phase_duration_ms) = static_cast<uint32_t>(id(soft_brew_run_time)->state * 1000.0f);
+      - script.execute: pump_output_on
+      - delay: !lambda 'return static_cast<uint32_t>(id(soft_brew_run_time)->state * 1000.0f);'
+      - text_sensor.template.publish:
+          id: machine_status_text
+          state: "Finish"
+      - script.execute: brew_finish
+
   - id: brew_straight
     mode: restart
     then:
       - lambda: |-
           id(brewing_active) = true;
           id(continuous_brew_active) = false;
+          id(last_brew_type) = 3;
           id(steam_mode_active) = false;
           id(brew_cycle_success) = true;
           id(brew_finish_display_until) = 0;
@@ -989,17 +1552,10 @@ script:
           id(current_phase) = 3;
           id(phase_start_ms) = now;
           id(phase_duration_ms) = brew_ms;
-      - switch.template.publish:
-          id: steam_mode_switch
-          state: false
-      - climate.control:
-          id: brew_pid
-          mode: HEAT
-          target_temperature: !lambda 'return id(brew_set_temp)->state;'
       - script.execute: valve_output_on
       - text_sensor.template.publish:
           id: machine_status_text
-          state: "Straight"
+          state: "Brewing: Straight"
       - script.execute: pump_output_on
       - delay: !lambda 'return static_cast<uint32_t>(id(straight_brew_run_time)->state * 1000.0f);'
       - text_sensor.template.publish:
@@ -1013,6 +1569,7 @@ script:
       - lambda: |-
           id(brewing_active) = true;
           id(continuous_brew_active) = true;
+          id(last_brew_type) = 4;
           id(steam_mode_active) = false;
           id(brew_cycle_success) = false;
           id(brew_finish_display_until) = 0;
@@ -1021,10 +1578,7 @@ script:
           id(total_start_ms) = now;
           id(total_duration_ms) = 0;
           id(continuous_brew_start_ms) = now;
-          id(machine_status_text).publish_state("Continuous");
-      - switch.template.publish:
-          id: steam_mode_switch
-          state: false
+          id(machine_status_text).publish_state("Brewing: Continuous");
       - script.execute: valve_output_on
       - script.execute: pump_output_on
 
@@ -1058,18 +1612,11 @@ script:
           id(phase_duration_ms) = 0;
           id(total_start_ms) = now;
           id(total_duration_ms) = 0;
-      - switch.template.publish:
-          id: steam_mode_switch
-          state: true
       - script.execute: pump_output_off_guard
       - script.execute: valve_output_off_guard
       - text_sensor.template.publish:
           id: machine_status_text
-          state: "Steam"
-      - climate.control:
-          id: brew_pid
-          mode: HEAT
-          target_temperature: !lambda 'return id(steam_set_temp)->state;'
+          state: "Steam Mode"
       - script.execute: start_steam_timer
 
   - id: exit_steam_mode
@@ -1090,10 +1637,6 @@ script:
             - text_sensor.template.publish:
                 id: machine_status_text
                 state: "Cooling"
-            - climate.control:
-                id: brew_pid
-                mode: HEAT
-                target_temperature: !lambda 'return id(brew_set_temp)->state;'
             - script.execute: cancel_steam_timer
             - delay: 2s
             - if:
@@ -1114,9 +1657,9 @@ script:
           id(last_cleaning_mode) = 1;
           id(cleaning_complete_until) = 0;
           id(cleaning_cycle_index) = 0;
-          id(cleaning_cycles_total) = 5;
+          id(cleaning_cycles_total) = static_cast<uint8_t>(id(backflush_cycles)->state);
           id(cleaning_step_phase) = 0;
-          id(machine_status_text).publish_state("Backflush");
+          id(machine_status_text).publish_state("Cleaning: Backflush");
       - script.execute: clean_backflush_cycle
 
   - id: clean_backflush_cycle
@@ -1133,34 +1676,45 @@ script:
           then:
             - lambda: |-
                 id(cleaning_cycle_index) += 1;
-                const uint32_t step_ms = static_cast<uint32_t>(id(backflush_step_time)->state * 1000.0f);
+                const uint32_t fill_ms = static_cast<uint32_t>(id(backflush_fill_time)->state * 1000.0f);
                 id(cleaning_step_phase) = 1;
                 id(cleaning_step_start_ms) = millis();
-                id(cleaning_step_duration_ms) = step_ms;
-                char buf[24];
-                snprintf(buf, sizeof(buf), "Backflush %u/5",
-                         static_cast<unsigned>(id(cleaning_cycle_index)));
+                id(cleaning_step_duration_ms) = fill_ms;
+                char buf[32];
+                snprintf(buf, sizeof(buf), "Backflush %u/%u",
+                         static_cast<unsigned>(id(cleaning_cycle_index)),
+                         static_cast<unsigned>(id(cleaning_cycles_total)));
                 id(machine_status_text).publish_state(buf);
             - script.execute: pump_output_on
             - script.execute: valve_output_on
-            - delay: !lambda 'return static_cast<uint32_t>(id(backflush_step_time)->state * 1000.0f);'
+            - delay: !lambda 'return static_cast<uint32_t>(id(backflush_fill_time)->state * 1000.0f);'
             - if:
                 condition:
                   lambda: 'return id(cleaning_mode) == 1;'
                 then:
-                  - lambda: |-
-                      const uint32_t step_ms = static_cast<uint32_t>(id(backflush_step_time)->state * 1000.0f);
-                      id(cleaning_step_phase) = 2;
-                      id(cleaning_step_start_ms) = millis();
-                      id(cleaning_step_duration_ms) = step_ms;
-                      char buf[24];
-                      snprintf(buf, sizeof(buf), "Backflush rest %u",
-                               static_cast<unsigned>(id(cleaning_cycle_index)));
-                      id(machine_status_text).publish_state(buf);
-                  - script.execute: pump_output_off_guard
-                  - script.execute: valve_output_off_guard
-                  - delay: !lambda 'return static_cast<uint32_t>(id(backflush_step_time)->state * 1000.0f);'
-                  - script.execute: clean_backflush_cycle
+                  - if:
+                      condition:
+                        lambda: 'return id(cleaning_cycle_index) < id(cleaning_cycles_total);'
+                      then:
+                        - lambda: |-
+                            const uint32_t flush_ms = static_cast<uint32_t>(id(backflush_flush_time)->state * 1000.0f);
+                            id(cleaning_step_phase) = 2;
+                            id(cleaning_step_start_ms) = millis();
+                            id(cleaning_step_duration_ms) = flush_ms;
+                            char buf[32];
+                            snprintf(buf, sizeof(buf), "Backflush rest %u",
+                                     static_cast<unsigned>(id(cleaning_cycle_index)));
+                            id(machine_status_text).publish_state(buf);
+                        - script.execute: pump_output_off_guard
+                        - script.execute: valve_output_off_guard
+                        - delay: !lambda 'return static_cast<uint32_t>(id(backflush_flush_time)->state * 1000.0f);'
+                        - script.execute: clean_backflush_cycle
+                      else:
+                        - lambda: |-
+                            id(cleaning_step_phase) = 2;
+                        - script.execute: pump_output_off_guard
+                        - script.execute: cleaning_finish
+                        - script.execute: valve_output_on
 
   - id: clean_purge
     mode: restart
@@ -1177,7 +1731,7 @@ script:
           id(cleaning_step_phase) = 1;
           id(cleaning_step_start_ms) = millis();
           id(cleaning_step_duration_ms) = step_ms;
-          id(machine_status_text).publish_state("Purge");
+          id(machine_status_text).publish_state("Cleaning: Purge");
       - script.execute: pump_output_on
       - script.execute: valve_output_on
       - delay: !lambda 'return static_cast<uint32_t>(id(purge_duration)->state * 1000.0f);'
@@ -1189,17 +1743,18 @@ script:
       - script.execute: pump_and_valve_off_guard
       - lambda: |-
           const uint32_t now = millis();
+          const uint32_t display_ms = static_cast<uint32_t>(id(result_display_time)->state * 1000.0f);
           id(cleaning_step_phase) = 0;
           id(cleaning_step_duration_ms) = 0;
           id(cleaning_cycle_index) = 0;
           id(cleaning_mode) = 0;
-          id(cleaning_complete_until) = now + 5000UL;
+          id(cleaning_complete_until) = now + display_ms;
           if (id(last_cleaning_mode) == 1) {
-            id(machine_status_text).publish_state("Backflush done");
+            id(machine_status_text).publish_state("Cleaning: Backflush");
           } else if (id(last_cleaning_mode) == 2) {
-            id(machine_status_text).publish_state("Purge done");
+            id(machine_status_text).publish_state("Cleaning: Purge");
           } else {
-            id(machine_status_text).publish_state("Cleaning done");
+            id(machine_status_text).publish_state("Cleaning");
           }
 
   - id: cleaning_cancel
@@ -1218,7 +1773,7 @@ script:
                 id(cleaning_step_duration_ms) = 0;
                 id(cleaning_cycle_index) = 0;
                 id(cleaning_complete_until) = now + 5000UL;
-                id(machine_status_text).publish_state("Cleaning cancel");
+                id(machine_status_text).publish_state("Cleaning: Cancelled");
 
 i2c:
   sda: GPIO21
@@ -1240,7 +1795,7 @@ display:
     address: 0x3C
     offset_x: 2
     offset_y: 0
-    update_interval: 0.25s
+    update_interval: 0.5s
     flip_x: false
     flip_y: false
     lambda: |-
@@ -1283,24 +1838,34 @@ display:
       pid_pct = std::max(0.0f, std::min(100.0f, pid_pct));
 
       if (isnan(temp)) {
-        it.printf(0, y_temp, id(font_small), "T: --.-°C");
+        it.printf(0, y_temp, id(font_small), "T:--.-");
       } else {
-        it.printf(0, y_temp, id(font_small), "T: %.1f°C", temp);
+        it.printf(0, y_temp, id(font_small), "T:%.1f", temp);
       }
 
-      bool cleaning_active = (id(cleaning_mode) != 0);
-      bool cleaning_message = (!cleaning_active && id(cleaning_complete_until) > now);
-      bool show_setpoint_line = !(cleaning_active || cleaning_message);
+      char status_icons[8] = "";
+      if (id(heater_allowed)) {
+        strlcat(status_icons, "H", sizeof(status_icons));
+      }
+      if (id(pump_override_state) || id(brewing_active) || id(continuous_brew_active)) {
+        strlcat(status_icons, "P", sizeof(status_icons));
+      }
+      if (id(valve_override_state) || id(brewing_active) || id(continuous_brew_active)) {
+        strlcat(status_icons, "V", sizeof(status_icons));
+      }
+      it.printf(127, y_temp, id(font_small), TextAlign::TOP_RIGHT, "%s", status_icons);
 
+      bool show_setpoint_line = !isnan(temp) && !isnan(target);
       if (show_setpoint_line) {
-        if (isnan(target)) {
-          it.printf(0, y_set, id(font_small), "S: --.-°C  P:%3.0f%%", pid_pct);
-        } else {
-          it.printf(0, y_set, id(font_small), "S: %.1f°C  P:%3.0f%%", target, pid_pct);
-        }
+        it.printf(0, y_set, id(font_small), "S:%.1f", target);
+        it.printf(127, y_set, id(font_small), TextAlign::TOP_RIGHT, "%.0f%%", pid_pct);
+        it.line(0, y_base_with_set - 1, 127, y_base_with_set - 1);
       }
 
-      const uint32_t idle_duration_ms =
+      bool cleaning_active = (id(cleaning_mode) > 0);
+      bool cleaning_message = (id(cleaning_complete_until) > now);
+
+      uint32_t idle_duration_ms =
           static_cast<uint32_t>(id(idle_timer_minutes)->state * 60000.0f);
       uint32_t idle_remaining_ms = 0;
       if (id(idle_timer_active) && idle_duration_ms > 0) {
@@ -1377,7 +1942,7 @@ display:
               (id(cleaning_step_phase) == 2 ? "Off" : "--");
 
           if (total_cycles == 0) total_cycles = 1;
-          it.printf(0, content_y1, id(font_small), "%s %u/%u %s",
+          it.printf(0, content_y1, id(font_small), "[C]%s %u/%u %s",
                     mode_str,
                     static_cast<unsigned>(current_cycle),
                     static_cast<unsigned>(total_cycles),
@@ -1407,71 +1972,74 @@ display:
               float base = (current_cycle > 0)
                              ? static_cast<float>(current_cycle - 1) * 2.0f
                              : 0.0f;
-              float phase_fraction =
-                  (id(cleaning_step_duration_ms) > 0)
-                      ? (static_cast<float>(step_elapsed) /
-                         static_cast<float>(id(cleaning_step_duration_ms)))
-                      : 0.0f;
+              float phase_prog = 0.0f;
               if (id(cleaning_step_phase) == 1) {
-                progress_value =
-                    (base + phase_fraction) / (total_cycles * 2.0f);
+                phase_prog = (id(cleaning_step_duration_ms) > 0)
+                               ? static_cast<float>(step_elapsed) /
+                                 static_cast<float>(id(cleaning_step_duration_ms))
+                               : 0.0f;
               } else if (id(cleaning_step_phase) == 2) {
-                progress_value =
-                    (base + 1.0f + phase_fraction) / (total_cycles * 2.0f);
-              } else {
-                progress_value =
-                    static_cast<float>(current_cycle) /
-                    static_cast<float>(total_cycles);
+                phase_prog = 1.0f;
+                if (id(cleaning_step_duration_ms) > 0) {
+                  phase_prog += static_cast<float>(step_elapsed) /
+                                static_cast<float>(id(cleaning_step_duration_ms));
+                }
               }
-            } else if (id(cleaning_mode) == 2 &&
-                       id(cleaning_step_duration_ms) > 0) {
-              progress_value =
-                  static_cast<float>(step_elapsed) /
-                  static_cast<float>(id(cleaning_step_duration_ms));
+              float total_phases = static_cast<float>(total_cycles) * 2.0f;
+              progress_value = (base + phase_prog) / total_phases;
+              show_progress = true;
+            } else if (id(cleaning_mode) == 2 && total_cycles > 0) {
+              // Purge mode: progress is based on completed cycles plus current step progress
+              float cycle_prog = (current_cycle > 0 && total_cycles > 0)
+                                   ? static_cast<float>(current_cycle - 1) /
+                                     static_cast<float>(total_cycles)
+                                   : 0.0f;
+              float step_prog = (id(cleaning_step_duration_ms) > 0)
+                                  ? static_cast<float>(step_elapsed) /
+                                    static_cast<float>(id(cleaning_step_duration_ms))
+                                  : 0.0f;
+              // Normalize: add fraction of the current cycle's step progress divided across total cycles
+              progress_value = cycle_prog + (step_prog / static_cast<float>(total_cycles));
+              // Clamp to [0,1]
+              if (progress_value < 0.0f) progress_value = 0.0f;
+              if (progress_value > 1.0f) progress_value = 1.0f;
+              show_progress = true;
             }
-            show_progress = true;
-          } else {
-            it.printf(0, content_y2, id(font_small), "Time --:--/--:--");
-          }
-
-          if (!id(heater_allowed)) {
-            it.printf(0, content_y3, id(font_small), "Heater OFF");
-          } else {
-            it.printf(0, content_y3, id(font_small), "Cleaning...");
           }
         } else {
-          const char *mode_str =
-              (id(last_cleaning_mode) == 1) ? "Backfl" :
-              (id(last_cleaning_mode) == 2 ? "Purge" : "Clean");
-          it.printf(0, content_y1, id(font_small), "%s done", mode_str);
-          it.printf(0, content_y2, id(font_small), "Ready");
+          it.printf(0, content_y1, id(font_small), "[C]%s",
+                    id(machine_status_text).state.c_str());
+          show_progress = true;
+          progress_value = 1.0f;
         }
       } else if (brew_active) {
-        if (continuous) {
-          it.printf(0, content_y1, id(font_small), "Continuous");
-          char run_buf[8];
-          fmt_time(now - id(continuous_brew_start_ms), run_buf, sizeof(run_buf));
-          it.printf(0, content_y2, id(font_small), "Run %s", run_buf);
-          it.printf(0, content_y3, id(font_small), "Stop to end");
-        } else if (brew_finished_screen) {
-          const bool success = id(brew_cycle_success);
-          it.printf(0, content_y1, id(font_small),
-                    success ? "Brew done" : "Brew stop");
+        const char *mode_name = "";
+        switch (id(active_brew_mode)) {
+          case 1: mode_name = "Press"; break;
+          case 2: mode_name = "Soft"; break;
+          case 3: mode_name = "Straight"; break;
+          case 4: mode_name = "Cont"; break;
+        }
+        if (brew_finished_screen) {
+          bool success = id(brew_cycle_success);
+          it.printf(0, content_y1, id(font_small), "[B]%s %s",
+                    mode_name, success ? "Done" : "Stop");
           show_progress = true;
           progress_value = 1.0f;
         } else {
           const char *phase_name = "Ready";
+          const char *icon = "[B]";
           switch (id(current_phase)) {
             case 1: phase_name = "Preinfuse"; break;
             case 2: phase_name = "Bloom";     break;
             case 3: phase_name = "Brew";      break;
             case 4: phase_name = "Vent";      break;
           }
-          it.printf(0, content_y1, id(font_small), "%s", phase_name);
+          it.printf(0, content_y1, id(font_small), "[B]%s %s", mode_name, phase_name);
 
           char elapsed_buf[8];
           fmt_time(total_elapsed, elapsed_buf, sizeof(elapsed_buf));
-          it.printf(0, content_y2, id(font_small), "Elapsed %s", elapsed_buf);
+          it.printf(0, content_y2, id(font_small), "Time %s", elapsed_buf);
 
           show_progress = (total_duration > 0);
           progress_value =
@@ -1481,21 +2049,20 @@ display:
                   : 0.0f;
         }
       } else if (id(steam_mode_active)) {
+        it.printf(0, content_y1, id(font_small), "[S]Steam");
         if (id(steam_timer_active) && steam_remaining_ms > 0) {
           char steam_buf[8];
           fmt_time(steam_remaining_ms, steam_buf, sizeof(steam_buf));
-          it.printf(0, content_y1, id(font_small), "Steam timer %s", steam_buf);
+          it.printf(0, content_y2, id(font_small), "Timer %s", steam_buf);
         } else if (id(steam_timer_active)) {
-          it.printf(0, content_y1, id(font_small), "Steam timer --:--");
-        } else {
-          it.printf(0, content_y1, id(font_small), "Steam ready");
+          it.printf(0, content_y2, id(font_small), "Timer --:--");
         }
         if (!id(heater_allowed)) {
-          it.printf(0, content_y2, id(font_small), "Heater OFF");
+          it.printf(0, content_y3, id(font_small), "Heater OFF");
         }
       } else if (show_override_screen) {
         const std::string overrides = build_override_list();
-        it.printf(0, content_y1, id(font_small), "Overrides");
+        it.printf(0, content_y1, id(font_small), "[!]Overrides");
         it.printf(0, content_y2, id(font_small), "%s", overrides.c_str());
         if (!id(heater_allowed)) {
           it.printf(0, content_y3, id(font_small), "Heater OFF");
