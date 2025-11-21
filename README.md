@@ -6,9 +6,11 @@ This is my personal ESPHome code for my 17+ year old (rusty) Rancilio Silvia V2.
 
 # Features
 - Control of brew and steam temperatures using a PID
-- Pre-infusion and pause customization
-- Straight brew without pre-infusion and pause
+- Pressurized pre-infusion brew
+- Straight brew (without any pre-infusion)
+- Soft brew with only the 3-way valve open (without pump pressure)
 - Backflush automization
+- Customizable times and pauses for all brew variants
 - SH1106 display with current settings and status information
 - ESPHome webserver for full control via webpage
 - Home Assistant integration (with ESPHome)
