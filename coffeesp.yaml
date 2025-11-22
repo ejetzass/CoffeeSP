@@ -1,20 +1,22 @@
+# CoffeeSP - ESPHome PID controller with xs5871 TSIC integration, SH1106 128x64 display and relay control based on CleverCoffee PCB v1.6
+# https://github.com/ejetzass/CoffeeSP
 # ----
 # CleverCoffee ESP32 PCB Rev 1.6 Pin Map
 # ----
-# HT_RL (Heater SSR)              -> GPIO2   (Burst-fired SSR)
+# HT_RL (Heater SSR)              -> GPIO2  (Burst-fired SSR)
 # PV_RL VALVE (3-way valve SSR)   -> GPIO17
 # PV_RL PUMP  (Pump SSR)          -> GPIO27
 # TSIC Temperature sensor         -> GPIO16
-# Status LED                      -> GPIO26   (active-low: set inverted true if needed)
+# Status LED                      -> GPIO26 (active-low: set inverted true if needed)
 # I2C SDA/SCL (OLED, pressure)    -> GPIO21 / GPIO22
-# Brew switch / optocoupler       -> GPIO34
-# Steam switch                    -> GPIO35
-# Hot water switch (straight brew)-> GPIO36
-# Power switch                    -> GPIO39
-# Water level sensor (optional)   -> GPIO23
+# Brew button (pre-infusion)      -> GPIO34 (/ optocoupler)
+# Steam button                    -> GPIO35
+# Hot water button (straight)     -> GPIO36
+# Power button (soft)             -> GPIO39
+# Water level sensor (optional)   -> GPIO23 (currently unused)
 # Scale interface DAT2/DAT/CLK    -> GPIO25 / GPIO32 / GPIO33 (currently unused)
 # Reserved headers (future use)   -> GPIO1, GPIO3, GPIO4, GPIO5, GPIO18, GPIO19
-# JTAG debugger pads              -> GPIO12 (TDI), GPIO13 (TCK), GPIO14 (TMS), GPIO15 (TDO)
+# JTAG debugger pads              -> GPIO12 (TDI), GPIO13 (TCK), GPIO14 (TMS), GPIO15 (TDO) (currently unused)
 # ----
 
 substitutions:
@@ -27,11 +29,10 @@ esphome:
   comment: "ESPHome PID controller with xs5871 TSIC integration, SH1106 128x64 display and relay control based on CleverCoffee PCB v1.6"
   project:
     name: coffeesp.espresso_controller
-    version: "1.8.7"
+    version: "1.9.0"
   on_boot:
     priority: -10
     then:
-      - switch.turn_on: heater_enable
       - lambda: |-
           const uint32_t now = millis();
           id(current_phase) = id(steam_mode_active) ? 5 : 0;
@@ -40,9 +41,12 @@ esphome:
           id(total_start_ms) = now;
           id(total_duration_ms) = 0;
           id(brew_finish_display_until) = 0;
-      - text_sensor.template.publish:
-          id: machine_status_text
-          state: "Idle"
+      - delay: 5s
+      - switch.turn_on: heater_enable
+      - script.execute:
+          id: publish_status
+          code: "I0"
+          text: "Idle"
 
 esp32:
   board: az-delivery-devkit-v4
@@ -284,6 +288,14 @@ text_sensor:
     name: "${friendly_name} Status"
     update_interval: never
     icon: mdi:coffee-maker
+    web_server:
+      sorting_group_id: group_sensors
+
+  - platform: template
+    id: machine_status_code
+    name: "${friendly_name} Status Code"
+    update_interval: never
+    icon: mdi:code-tags
     web_server:
       sorting_group_id: group_sensors
 
@@ -643,7 +655,7 @@ switch:
     optimistic: false
     web_server:
       sorting_group_id: group_switch
-    restore_mode: ALWAYS_ON
+    restore_mode: RESTORE_DEFAULT_ON
     lambda: 'return id(heater_allowed);'
     turn_on_action:
       - if:
@@ -660,13 +672,14 @@ switch:
                 condition:
                   lambda: 'return !id(steam_mode_active) && !id(brewing_active) && !id(continuous_brew_active);'
                 then:
-                  - text_sensor.template.publish:
-                      id: machine_status_text
-                      state: !lambda "return (!id(pump_relay_enable)->state && !id(valve_relay_enable)->state) ? \"PID only\" : \"Idle\";"
+                  - lambda: |-
+                      bool pid_only = (!id(pump_relay_enable)->state && !id(valve_relay_enable)->state);
+                      id(publish_status)->execute("I0", pid_only ? "PID only" : "Idle");
           else:
-            - text_sensor.template.publish:
-                id: machine_status_text
-                state: "Temp invalid"
+            - script.execute:
+                id: publish_status
+                code: "XE"
+                text: "Temp invalid"
     turn_off_action:
       - lambda: 'id(heater_allowed) = false;'
       - if:
@@ -678,9 +691,10 @@ switch:
       - lambda: |-
           id(heater_output_level) = 0.0f;
       - script.execute: cancel_idle_timer
-      - text_sensor.template.publish:
-          id: machine_status_text
-          state: "Heater disabled"
+      - script.execute:
+          id: publish_status
+          code: "IH"
+          text: "Heater disabled"
 
   - platform: template
     name: "Pump SSR Override"
@@ -1228,7 +1242,7 @@ interval:
             if (duration_ms > 0 && now - id(idle_timer_start_ms) >= duration_ms) {
               id(idle_timer_active) = false;
               id(idle_timer_expired) = true;
-              id(machine_status_text).publish_state("Idle timeout");
+              id(publish_status)->execute("IP", "Idle timeout");
               if (id(heater_enable).state) {
                 id(heater_enable).turn_off();
               }
@@ -1239,7 +1253,7 @@ interval:
             const uint32_t duration_ms = static_cast<uint32_t>(id(steam_timer_minutes)->state * 60000.0f);
             if (duration_ms > 0 && now - id(steam_timer_start_ms) >= duration_ms) {
               id(steam_timer_active) = false;
-              id(machine_status_text).publish_state("Steam timer");
+              id(publish_status)->execute("MF", "Steam timer");
               id(exit_steam_mode).execute();
             }
           }
@@ -1249,9 +1263,9 @@ interval:
             id(brew_finish_display_until) = 0;
             if (!id(steam_mode_active) && id(heater_allowed) && !id(idle_timer_expired)) {
               if (!id(pump_relay_enable)->state && !id(valve_relay_enable)->state) {
-                id(machine_status_text).publish_state("PID only");
+                id(publish_status)->execute("I0", "PID only");
               } else {
-                id(machine_status_text).publish_state("Idle");
+                id(publish_status)->execute("I0", "Idle");
               }
             }
           }
@@ -1261,14 +1275,24 @@ interval:
             if (!id(steam_mode_active) && !id(brewing_active) &&
                 !id(continuous_brew_active) && id(cleaning_mode) == 0) {
               if (!id(pump_relay_enable)->state && !id(valve_relay_enable)->state) {
-                id(machine_status_text).publish_state(id(heater_allowed) ? "PID only" : "Heater disabled");
+                id(publish_status)->execute(id(heater_allowed) ? "I0" : "IH", id(heater_allowed) ? "PID only" : "Heater disabled");
               } else {
-                id(machine_status_text).publish_state(id(heater_allowed) ? "Idle" : "Heater disabled");
+                id(publish_status)->execute(id(heater_allowed) ? "I0" : "IH", id(heater_allowed) ? "Idle" : "Heater disabled");
               }
             }
           }
 
 script:
+  - id: publish_status
+    mode: single
+    parameters:
+      code: string
+      text: string
+    then:
+      - lambda: |-
+          id(machine_status_code).publish_state(code);
+          id(machine_status_text).publish_state(text);
+
   - id: pump_output_on
     mode: restart
     then:
@@ -1361,18 +1385,18 @@ script:
             const uint32_t display_ms = static_cast<uint32_t>(id(result_display_time)->state * 1000.0f);
             id(brew_finish_display_until) = now + display_ms;
             if (id(last_brew_type) == 1) {
-              id(machine_status_text).publish_state("Brew Finished: Pre-Infusion");
+              id(publish_status)->execute("PF", "Pre-Infusion Finished");
             } else if (id(last_brew_type) == 2) {
-              id(machine_status_text).publish_state("Brew Finished: Soft");
+              id(publish_status)->execute("SF", "Soft Finished");
             } else if (id(last_brew_type) == 3) {
-              id(machine_status_text).publish_state("Brew Finished: Straight");
+              id(publish_status)->execute("RF", "Straight Finished");
             } else if (id(last_brew_type) == 4) {
-              id(machine_status_text).publish_state("Brew Finished: Continuous");
+              id(publish_status)->execute("CF", "Continuous Finished");
             } else {
-              id(machine_status_text).publish_state("Brew Finished");
+              id(publish_status)->execute("PF", "Brew Finished");
             }
           } else if (!id(steam_mode_active)) {
-            id(machine_status_text).publish_state("Idle");
+            id(publish_status)->execute("I0", "Idle");
           }
       - if:
           condition:
@@ -1404,32 +1428,64 @@ script:
                 id(total_start_ms) = now;
                 id(phase_duration_ms) = 0;
                 id(phase_start_ms) = now;
-                id(machine_status_text).publish_state("Brewing: Continuous Stopped");
+                id(publish_status)->execute("CS", "Continuous Stopped");
             - delay: 500ms
             - if:
                 condition:
                   lambda: 'return !id(steam_mode_active) && id(heater_allowed) && !id(idle_timer_expired) && id(cleaning_mode) == 0;'
                 then:
-                  - text_sensor.template.publish:
-                      id: machine_status_text
-                      state: "Idle"
+                  - script.execute:
+                      id: publish_status
+                      code: "I0"
+                      text: "Idle"
       - if:
           condition:
             lambda: 'return !id(heater_allowed);'
           then:
-            - text_sensor.template.publish:
-                id: machine_status_text
-                state: "Heater disabled"
+            - script.execute:
+                id: publish_status
+                code: "IH"
+                text: "Heater disabled"
       - if:
           condition:
             lambda: 'return id(brewing_active);'
           then:
+            - script.stop: brew_preinfusion
+            - script.stop: brew_soft_preinfusion
+            - script.stop: brew_straight
+            - script.stop: brew_continuous
             - lambda: |-
                 id(brew_cycle_success) = false;
                 id(brew_finish_display_until) = 0;
-            - text_sensor.template.publish:
-                id: machine_status_text
-                state: "Brew stop"
+
+                const char *stop_code = "PS";
+                const char *stop_text = "Brew stop";
+
+                switch (id(last_brew_type)) {
+                  case 1:
+                    stop_code = "PS";
+                    stop_text = "Pressurized Stopped";
+                    break;
+                  case 2:
+                    stop_code = "SS";
+                    stop_text = "Soft Stopped";
+                    break;
+                  case 3:
+                    stop_code = "RS";
+                    stop_text = "Straight Stopped";
+                    break;
+                  case 4:
+                    stop_code = "CS";
+                    stop_text = "Continuous Stopped";
+                    break;
+                  default:
+                    stop_code = id(continuous_brew_active) ? "CS" : "PS";
+                    stop_text = "Brew stop";
+                    break;
+                }
+
+                id(machine_status_code).publish_state(stop_code);
+                id(machine_status_text).publish_state(stop_text);
             - script.execute: pump_output_off_guard
             - delay: 1s
             - script.execute: brew_finish
@@ -1461,9 +1517,10 @@ script:
             id(current_phase) = 3;
             id(phase_duration_ms) = brew_ms;
           }
-      - text_sensor.template.publish:
-          id: machine_status_text
-          state: "Brewing: Pre-Infusion"
+      - script.execute:
+          id: publish_status
+          code: "PW"
+          text: "Pre-Infusion: Wetting"
       - script.execute: valve_output_on
       - if:
           condition:
@@ -1480,22 +1537,21 @@ script:
                 id(current_phase) = 2;
                 id(phase_start_ms) = millis();
                 id(phase_duration_ms) = static_cast<uint32_t>(id(preinfuse_pause_time)->state * 1000.0f);
-            - text_sensor.template.publish:
-                id: machine_status_text
-                state: "Bloom"
+            - script.execute:
+                id: publish_status
+                code: "PB"
+                text: "Pre-Infusion: Bloom"
             - delay: !lambda 'return static_cast<uint32_t>(id(preinfuse_pause_time)->state * 1000.0f);'
-      - text_sensor.template.publish:
-          id: machine_status_text
-          state: "Brew"
+      - script.execute:
+          id: publish_status
+          code: "PR"
+          text: "Pre-Infusion: Brewing"
       - lambda: |-
           id(current_phase) = 3;
           id(phase_start_ms) = millis();
           id(phase_duration_ms) = static_cast<uint32_t>(id(brew_run_time)->state * 1000.0f);
       - script.execute: pump_output_on
       - delay: !lambda 'return static_cast<uint32_t>(id(brew_run_time)->state * 1000.0f);'
-      - text_sensor.template.publish:
-          id: machine_status_text
-          state: "Finish"
       - script.execute: brew_finish
 
   - id: brew_soft_preinfusion
@@ -1516,23 +1572,22 @@ script:
           id(phase_start_ms) = now;
           id(current_phase) = 1;
           id(phase_duration_ms) = soft_pre_ms;
-      - text_sensor.template.publish:
-          id: machine_status_text
-          state: "Brewing: Soft Pre-Infusion"
+      - script.execute:
+          id: publish_status
+          code: "SW"
+          text: "Soft: Pre-Wetting"
       - script.execute: valve_output_on
       - delay: !lambda 'return static_cast<uint32_t>(id(soft_preinfuse_time)->state * 1000.0f);'
-      - text_sensor.template.publish:
-          id: machine_status_text
-          state: "Brewing: Soft"
+      - script.execute:
+          id: publish_status
+          code: "SR"
+          text: "Soft: Brewing"
       - lambda: |-
           id(current_phase) = 3;
           id(phase_start_ms) = millis();
           id(phase_duration_ms) = static_cast<uint32_t>(id(soft_brew_run_time)->state * 1000.0f);
       - script.execute: pump_output_on
       - delay: !lambda 'return static_cast<uint32_t>(id(soft_brew_run_time)->state * 1000.0f);'
-      - text_sensor.template.publish:
-          id: machine_status_text
-          state: "Finish"
       - script.execute: brew_finish
 
   - id: brew_straight
@@ -1553,14 +1608,12 @@ script:
           id(phase_start_ms) = now;
           id(phase_duration_ms) = brew_ms;
       - script.execute: valve_output_on
-      - text_sensor.template.publish:
-          id: machine_status_text
-          state: "Brewing: Straight"
+      - script.execute:
+          id: publish_status
+          code: "RR"
+          text: "Straight"
       - script.execute: pump_output_on
       - delay: !lambda 'return static_cast<uint32_t>(id(straight_brew_run_time)->state * 1000.0f);'
-      - text_sensor.template.publish:
-          id: machine_status_text
-          state: "Finish"
       - script.execute: brew_finish
 
   - id: brew_continuous
@@ -1578,7 +1631,7 @@ script:
           id(total_start_ms) = now;
           id(total_duration_ms) = 0;
           id(continuous_brew_start_ms) = now;
-          id(machine_status_text).publish_state("Brewing: Continuous");
+          id(publish_status)->execute("CR", "Continuous");
       - script.execute: valve_output_on
       - script.execute: pump_output_on
 
@@ -1614,9 +1667,10 @@ script:
           id(total_duration_ms) = 0;
       - script.execute: pump_output_off_guard
       - script.execute: valve_output_off_guard
-      - text_sensor.template.publish:
-          id: machine_status_text
-          state: "Steam Mode"
+      - script.execute:
+          id: publish_status
+          code: "MT"
+          text: "Steam"
       - script.execute: start_steam_timer
 
   - id: exit_steam_mode
@@ -1634,18 +1688,20 @@ script:
                 id(phase_duration_ms) = 0;
                 id(total_start_ms) = now;
                 id(total_duration_ms) = 0;
-            - text_sensor.template.publish:
-                id: machine_status_text
-                state: "Cooling"
+            - script.execute:
+                id: publish_status
+                code: "MC"
+                text: "Cooling"
             - script.execute: cancel_steam_timer
             - delay: 2s
             - if:
                 condition:
                   lambda: 'return !id(brewing_active) && !id(continuous_brew_active) && id(cleaning_mode) == 0;'
                 then:
-                  - text_sensor.template.publish:
-                      id: machine_status_text
-                      state: "Idle"
+                  - script.execute:
+                      id: publish_status
+                      code: "I0"
+                      text: "Idle"
 
   - id: clean_backflush
     mode: restart
@@ -1659,7 +1715,7 @@ script:
           id(cleaning_cycle_index) = 0;
           id(cleaning_cycles_total) = static_cast<uint8_t>(id(backflush_cycles)->state);
           id(cleaning_step_phase) = 0;
-          id(machine_status_text).publish_state("Cleaning: Backflush");
+          id(publish_status)->execute("KO", "Backflush");
       - script.execute: clean_backflush_cycle
 
   - id: clean_backflush_cycle
@@ -1684,7 +1740,7 @@ script:
                 snprintf(buf, sizeof(buf), "Backflush %u/%u",
                          static_cast<unsigned>(id(cleaning_cycle_index)),
                          static_cast<unsigned>(id(cleaning_cycles_total)));
-                id(machine_status_text).publish_state(buf);
+                id(publish_status)->execute("KO", buf);
             - script.execute: pump_output_on
             - script.execute: valve_output_on
             - delay: !lambda 'return static_cast<uint32_t>(id(backflush_fill_time)->state * 1000.0f);'
@@ -1704,7 +1760,7 @@ script:
                             char buf[32];
                             snprintf(buf, sizeof(buf), "Backflush rest %u",
                                      static_cast<unsigned>(id(cleaning_cycle_index)));
-                            id(machine_status_text).publish_state(buf);
+                            id(publish_status)->execute("KR", buf);
                         - script.execute: pump_output_off_guard
                         - script.execute: valve_output_off_guard
                         - delay: !lambda 'return static_cast<uint32_t>(id(backflush_flush_time)->state * 1000.0f);'
@@ -1731,7 +1787,7 @@ script:
           id(cleaning_step_phase) = 1;
           id(cleaning_step_start_ms) = millis();
           id(cleaning_step_duration_ms) = step_ms;
-          id(machine_status_text).publish_state("Cleaning: Purge");
+          id(publish_status)->execute("KP", "Purge");
       - script.execute: pump_output_on
       - script.execute: valve_output_on
       - delay: !lambda 'return static_cast<uint32_t>(id(purge_duration)->state * 1000.0f);'
@@ -1750,11 +1806,11 @@ script:
           id(cleaning_mode) = 0;
           id(cleaning_complete_until) = now + display_ms;
           if (id(last_cleaning_mode) == 1) {
-            id(machine_status_text).publish_state("Cleaning: Backflush");
+            id(publish_status)->execute("KF", "Backflush Finished");
           } else if (id(last_cleaning_mode) == 2) {
-            id(machine_status_text).publish_state("Cleaning: Purge");
+            id(publish_status)->execute("KF", "Purge Finished");
           } else {
-            id(machine_status_text).publish_state("Cleaning");
+            id(publish_status)->execute("KF", "Cleaning Finished");
           }
 
   - id: cleaning_cancel
@@ -1773,7 +1829,7 @@ script:
                 id(cleaning_step_duration_ms) = 0;
                 id(cleaning_cycle_index) = 0;
                 id(cleaning_complete_until) = now + 5000UL;
-                id(machine_status_text).publish_state("Cleaning: Cancelled");
+                id(publish_status)->execute("KS", "Cleaning Cancelled");
 
 i2c:
   sda: GPIO21
